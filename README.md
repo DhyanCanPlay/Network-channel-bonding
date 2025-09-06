@@ -20,11 +20,9 @@ The project consists of two Go applications:
 ## Prerequisites
 
 1.  **Go**: Ensure you have Go (1.18+) installed on both client and server machines.
-2.  **Water Library**: Install the `water` library dependency on both machines.
-    ```sh
-    go get github.com/songgao/water
-    ```
-3.  **Root/Admin Privileges**: The applications require elevated privileges to create and manage network interfaces and routes.
+2.  **Root/Admin Privileges**: The applications require elevated privileges to create and manage network interfaces and routes.
+
+This project uses Go modules, so the required `water` library will be downloaded automatically when you build the applications.
 
 ---
 
