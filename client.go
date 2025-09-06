@@ -175,6 +175,22 @@ func createTun(name, ipCIDR string) (*water.Interface, error) {
 		if err := exec.Command("ifconfig", ifce.Name(), "inet", addr, addr, "up").Run(); err != nil {
 			return nil, fmt.Errorf("failed to set IP address and bring up interface: %v", err)
 		}
+	case "windows":
+		// On Windows, we use netsh to configure the interface.
+		// This requires administrator privileges.
+		ip, ipnet, err := net.ParseCIDR(ipCIDR)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse CIDR %s: %v", ipCIDR, err)
+		}
+		mask := ipnet.Mask
+		subnetMask := fmt.Sprintf("%d.%d.%d.%d", mask[0], mask[1], mask[2], mask[3])
+
+		cmd := exec.Command("netsh", "interface", "ip", "set", "address", fmt.Sprintf("name=\"%s\"", ifce.Name()), "static", ip.String(), subnetMask)
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			return nil, fmt.Errorf("netsh command failed: %v\nOutput: %s", err, string(output))
+		}
+		log.Printf("Successfully configured TUN interface %s with IP %s", ifce.Name(), ip.String())
 	default:
 		return nil, fmt.Errorf("unsupported platform: %s", runtime.GOOS)
 	}
@@ -223,8 +239,19 @@ func decrypt(ciphertext, key []byte) ([]byte, error) {
 }
 
 // discoverInterfaces finds all non-loopback network interfaces and creates UDP sockets for them
-func discoverInterfaces(serverAddr *net.UDPAddr) []*InterfaceConn {
+func discoverInterfaces(serverAddr *net.UDPAddr, selectedIPs []string) []*InterfaceConn {
 	var conns []*InterfaceConn
+
+	// Create a set for quick lookup if specific IPs are selected.
+	// If the list is empty, all suitable interfaces will be used.
+	selectedIPSet := make(map[string]struct{})
+	useAllInterfaces := len(selectedIPs) == 0
+	if !useAllInterfaces {
+		for _, ip := range selectedIPs {
+			selectedIPSet[strings.TrimSpace(ip)] = struct{}{}
+		}
+	}
+
 	ifaces, err := net.Interfaces()
 	if err != nil {
 		log.Fatalf("Failed to get system interfaces: %v", err)
@@ -253,6 +280,13 @@ func discoverInterfaces(serverAddr *net.UDPAddr) []*InterfaceConn {
 				continue
 			}
 
+			// If specific interfaces are chosen, check if this one is on the list.
+			if !useAllInterfaces {
+				if _, ok := selectedIPSet[ip.String()]; !ok {
+					continue // Not a selected interface, so skip.
+				}
+			}
+
 			localUDPAddr := &net.UDPAddr{IP: ip, Port: 0} // Port 0 lets OS choose
 			conn, err := net.DialUDP("udp", localUDPAddr, serverAddr)
 			if err != nil {
@@ -272,65 +306,38 @@ func discoverInterfaces(serverAddr *net.UDPAddr) []*InterfaceConn {
 	return conns
 }
 
-// healthChecker sends periodic health checks on all interfaces to measure latency
-func healthChecker(s *Scheduler, key []byte) {
-	var healthCheckSeq uint64 = 0
-	pendingChecks := make(map[uint64]time.Time)
-	var mu sync.Mutex
-
-	go func() {
-		for {
-			time.Sleep(2 * time.Second)
-			interfaces := s.GetInterfaces()
-			if len(interfaces) == 0 {
-				continue
-			}
-
-			mu.Lock()
-			currentSeq := healthCheckSeq
-			healthCheckSeq++
-			mu.Unlock()
-
-			header := PacketHeader{SequenceNumber: currentSeq, Type: PacketHealthCheck}
-			payload, err := encrypt(header.Serialize(), key)
-			if err != nil {
-				log.Printf("Health Check: Failed to encrypt: %v", err)
-				continue
-			}
-
-			mu.Lock()
-			pendingChecks[currentSeq] = time.Now()
-			mu.Unlock()
-
-			for _, iface := range interfaces {
-				if _, err := iface.Conn.Write(payload); err != nil {
-					// Don't log error here, as it can be noisy if an interface goes down
-				}
-			}
-		}
-	}()
-
-	// This function is called from the main read loop when a health check response is received
-	handleHealthCheckResponse := func(header PacketHeader) {
-		mu.Lock()
-		defer mu.Unlock()
-
-		if startTime, ok := pendingChecks[header.SequenceNumber]; ok {
-			latency := time.Since(startTime)
-			delete(pendingChecks, header.SequenceNumber)
-			// This is a bit of a hack: we don't know which interface delivered the response.
-			// We'll update the latency for ALL interfaces. The 'speed' scheduler will
-			// still pick the one that consistently delivers first.
-			interfaces := s.GetInterfaces()
-			for _, iface := range interfaces {
-				iface.SetLatency(latency)
-			}
-			log.Printf("Health check RTT: %v (updated %d interfaces)", latency, len(interfaces))
-		}
+// listInterfacesAndExit prints available network interfaces and exits.
+func listInterfacesAndExit() {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		log.Fatalf("Failed to get system interfaces: %v", err)
 	}
 
-	// Expose the handler
-	_ = handleHealthCheckResponse // This is just to show where it would be used
+	fmt.Println("Available network interfaces:")
+	for _, i := range ifaces {
+		// Skip loopback and down interfaces
+		if (i.Flags&net.FlagUp == 0) || (i.Flags&net.FlagLoopback != 0) {
+			continue
+		}
+		addrs, err := i.Addrs()
+		if err != nil {
+			log.Printf("Could not get addresses for interface %s: %v", i.Name, err)
+			continue
+		}
+		fmt.Printf("- Interface: %s\n", i.Name)
+		for _, addr := range addrs {
+			var ip net.IP
+			switch v := addr.(type) {
+			case *net.IPNet:
+				ip = v.IP
+			case *net.IPAddr:
+				ip = v.IP
+			}
+			if ip != nil && ip.To4() != nil {
+				fmt.Printf("  - IPv4 Address: %s\n", ip.String())
+			}
+		}
+	}
 }
 
 func main() {
@@ -338,7 +345,14 @@ func main() {
 	serverPort := flag.Int("port", 8080, "Server port")
 	keyStr := flag.String("key", "", "32-byte pre-shared key for encryption")
 	mode := flag.String("mode", "speed", "Scheduler mode: speed or redundant")
+	listInterfaces := flag.Bool("list-interfaces", false, "List available network interfaces and exit")
+	interfacesStr := flag.String("interfaces", "", "Comma-separated list of local interface IPs to use (e.g., \"192.168.1.10,10.0.0.5\")")
 	flag.Parse()
+
+	if *listInterfaces {
+		listInterfacesAndExit()
+		return
+	}
 
 	if *serverIP == "" || *keyStr == "" {
 		log.Fatalf("Server IP (-server) and key (-key) are required")
@@ -365,7 +379,11 @@ func main() {
 	}
 
 	// Discover interfaces and create scheduler
-	interfaces := discoverInterfaces(serverAddr)
+	var selectedIPs []string
+	if *interfacesStr != "" {
+		selectedIPs = strings.Split(*interfacesStr, ",")
+	}
+	interfaces := discoverInterfaces(serverAddr, selectedIPs)
 	if len(interfaces) == 0 {
 		log.Fatalf("No usable network interfaces found. Please check network connectivity.")
 	}
